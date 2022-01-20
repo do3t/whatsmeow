@@ -61,7 +61,7 @@ var BaseClientPayload = &waProto.ClientPayload{
 }
 
 var CompanionProps = &waProto.CompanionProps{
-	Os: proto.String("whatsmeow"),
+	Os: waProto.CompanionProps_CHROME.Enum(),
 	Version: &waProto.AppVersion{
 		Primary:   proto.Uint32(0),
 		Secondary: proto.Uint32(1),
