@@ -8,6 +8,7 @@ package whatsmeow
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -19,7 +20,7 @@ func (cli *Client) handleReceipt(node *waBinary.Node) {
 	receipt, err := cli.parseReceipt(node)
 	if err != nil {
 		cli.Log.Warnf("Failed to parse receipt: %v", err)
-	} else {
+	} else if receipt != nil {
 		if receipt.Type == events.ReceiptTypeRetry {
 			go func() {
 				err := cli.handleRetryReceipt(receipt, node)
@@ -33,16 +34,46 @@ func (cli *Client) handleReceipt(node *waBinary.Node) {
 	go cli.sendAck(node)
 }
 
+func (cli *Client) handleGroupedReceipt(partialReceipt events.Receipt, participants *waBinary.Node) {
+	pag := participants.AttrGetter()
+	partialReceipt.MessageIDs = []types.MessageID{pag.String("key")}
+	for _, child := range participants.GetChildren() {
+		if child.Tag != "user" {
+			cli.Log.Warnf("Unexpected node in grouped receipt participants: %s", child.XMLString())
+			continue
+		}
+		ag := child.AttrGetter()
+		receipt := partialReceipt
+		receipt.Timestamp = ag.UnixTime("t")
+		receipt.MessageSource.Sender = ag.JID("jid")
+		if !ag.OK() {
+			cli.Log.Warnf("Failed to parse user node %s in grouped receipt: %v", child.XMLString(), ag.Error())
+			continue
+		}
+		go cli.dispatchEvent(&receipt)
+	}
+}
+
 func (cli *Client) parseReceipt(node *waBinary.Node) (*events.Receipt, error) {
 	ag := node.AttrGetter()
-	source, err := cli.parseMessageSource(node)
+	source, err := cli.parseMessageSource(node, false)
 	if err != nil {
 		return nil, err
 	}
 	receipt := events.Receipt{
 		MessageSource: source,
-		Timestamp:     time.Unix(ag.Int64("t"), 0),
+		Timestamp:     ag.UnixTime("t"),
 		Type:          events.ReceiptType(ag.OptionalString("type")),
+	}
+	if source.IsGroup && source.Sender.IsEmpty() {
+		participantTags := node.GetChildrenByTag("participants")
+		if len(participantTags) == 0 {
+			return nil, &ElementMissingError{Tag: "participants", In: "grouped receipt"}
+		}
+		for _, pcp := range participantTags {
+			cli.handleGroupedReceipt(receipt, &pcp)
+		}
+		return nil, nil
 	}
 	mainMessageID := ag.String("id")
 	if !ag.OK() {
@@ -123,13 +154,35 @@ func (cli *Client) MarkRead(ids []types.MessageID, timestamp time.Time, chat, se
 	return cli.sendNode(node)
 }
 
+// SetForceActiveDeliveryReceipts will force the client to send normal delivery
+// receipts (which will show up as the two gray ticks on WhatsApp), even if the
+// client isn't marked as online.
+//
+// By default, clients that haven't been marked as online will send delivery
+// receipts with type="inactive", which is transmitted to the sender, but not
+// rendered in the official WhatsApp apps. This is consistent with how WhatsApp
+// web works when it's not in the foreground.
+//
+// To mark the client as online, use
+//  cli.SendPresence(types.PresenceAvailable)
+//
+// Note that if you turn this off (i.e. call SetForceActiveDeliveryReceipts(false)),
+// receipts will act like the client is offline until SendPresence is called again.
+func (cli *Client) SetForceActiveDeliveryReceipts(active bool) {
+	if active {
+		atomic.StoreUint32(&cli.sendActiveReceipts, 2)
+	} else {
+		atomic.StoreUint32(&cli.sendActiveReceipts, 0)
+	}
+}
+
 func (cli *Client) sendMessageReceipt(info *types.MessageInfo) {
 	attrs := waBinary.Attrs{
 		"id": info.ID,
 	}
 	if info.IsFromMe {
 		attrs["type"] = "sender"
-	} else {
+	} else if atomic.LoadUint32(&cli.sendActiveReceipts) == 0 {
 		attrs["type"] = "inactive"
 	}
 	attrs["to"] = info.Chat
@@ -137,6 +190,9 @@ func (cli *Client) sendMessageReceipt(info *types.MessageInfo) {
 		attrs["participant"] = info.Sender
 	} else if info.IsFromMe {
 		attrs["recipient"] = info.Sender
+	} else {
+		// Override the to attribute with the JID version with a device number
+		attrs["to"] = info.Sender
 	}
 	err := cli.sendNode(waBinary.Node{
 		Tag:   "receipt",

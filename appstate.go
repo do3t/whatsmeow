@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tulir Asokan
+// Copyright (c) 2022 Tulir Asokan
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -7,12 +7,16 @@
 package whatsmeow
 
 import (
+	"context"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -52,9 +56,23 @@ func (cli *Client) FetchAppState(name appstate.WAPatchName, fullSync, onlyIfNotS
 
 		mutations, newState, err := cli.appStateProc.DecodePatches(patches, state, true)
 		if err != nil {
+			if errors.Is(err, appstate.ErrKeyNotFound) {
+				go cli.requestMissingAppStateKeys(context.TODO(), patches)
+			}
 			return fmt.Errorf("failed to decode app state %s patches: %w", name, err)
 		}
+		wasFullSync := state.Version == 0 && patches.Snapshot != nil
 		state = newState
+		if name == appstate.WAPatchCriticalUnblockLow && wasFullSync && !cli.EmitAppStateEventsOnFullSync {
+			var contacts []store.ContactEntry
+			mutations, contacts = cli.filterContacts(mutations)
+			cli.Log.Debugf("Mass inserting app state snapshot with %d contacts into the store", len(contacts))
+			err = cli.Store.Contacts.PutAllContactNames(contacts)
+			if err != nil {
+				// This is a fairly serious failure, so just abort the whole thing
+				return fmt.Errorf("failed to update contact store with data from snapshot: %v", err)
+			}
+		}
 		for _, mutation := range mutations {
 			cli.dispatchAppState(mutation, !fullSync || cli.EmitAppStateEventsOnFullSync)
 		}
@@ -66,6 +84,25 @@ func (cli *Client) FetchAppState(name appstate.WAPatchName, fullSync, onlyIfNotS
 		cli.Log.Debugf("Synced app state %s from version %d to %d", name, version, state.Version)
 	}
 	return nil
+}
+
+func (cli *Client) filterContacts(mutations []appstate.Mutation) ([]appstate.Mutation, []store.ContactEntry) {
+	filteredMutations := mutations[:0]
+	contacts := make([]store.ContactEntry, 0, len(mutations))
+	for _, mutation := range mutations {
+		if mutation.Index[0] == "contact" && len(mutation.Index) > 1 {
+			jid, _ := types.ParseJID(mutation.Index[1])
+			act := mutation.Action.GetContactAction()
+			contacts = append(contacts, store.ContactEntry{
+				JID:       jid,
+				FirstName: act.GetFirstName(),
+				FullName:  act.GetFullName(),
+			})
+		} else {
+			filteredMutations = append(filteredMutations, mutation)
+		}
+	}
+	return filteredMutations, contacts
 }
 
 func (cli *Client) dispatchAppState(mutation appstate.Mutation, dispatchEvts bool) {
@@ -114,6 +151,9 @@ func (cli *Client) dispatchAppState(mutation appstate.Mutation, dispatchEvts boo
 		if cli.Store.Contacts != nil {
 			storeUpdateError = cli.Store.Contacts.PutContactName(jid, act.GetFirstName(), act.GetFullName())
 		}
+	case "deleteChat":
+		act := mutation.Action.GetDeleteChatAction()
+		eventToDispatch = &events.DeleteChat{JID: jid, Timestamp: ts, Action: act}
 	case "star":
 		if len(mutation.Index) < 5 {
 			return
@@ -144,6 +184,12 @@ func (cli *Client) dispatchAppState(mutation appstate.Mutation, dispatchEvts boo
 			evt.SenderJID, _ = types.ParseJID(mutation.Index[4])
 		}
 		eventToDispatch = &evt
+	case "markChatAsRead":
+		eventToDispatch = &events.MarkChatAsRead{
+			JID:       jid,
+			Timestamp: ts,
+			Action:    mutation.Action.GetMarkChatAsReadAction(),
+		}
 	case "setting_pushName":
 		eventToDispatch = &events.PushNameSetting{Timestamp: ts, Action: mutation.Action.GetPushNameSetting()}
 		cli.Store.PushName = mutation.Action.GetPushNameSetting().GetName()
@@ -190,4 +236,46 @@ func (cli *Client) fetchAppStatePatches(name appstate.WAPatchName, fromVersion u
 		return nil, err
 	}
 	return appstate.ParsePatchList(resp, cli.downloadExternalAppStateBlob)
+}
+
+func (cli *Client) requestMissingAppStateKeys(ctx context.Context, patches *appstate.PatchList) {
+	cli.appStateKeyRequestsLock.Lock()
+	rawKeyIDs := cli.appStateProc.GetMissingKeyIDs(patches)
+	filteredKeyIDs := make([][]byte, 0, len(rawKeyIDs))
+	now := time.Now()
+	for _, keyID := range rawKeyIDs {
+		stringKeyID := hex.EncodeToString(keyID)
+		lastRequestTime := cli.appStateKeyRequests[stringKeyID]
+		if lastRequestTime.IsZero() || lastRequestTime.Add(24*time.Hour).Before(now) {
+			cli.appStateKeyRequests[stringKeyID] = now
+			filteredKeyIDs = append(filteredKeyIDs, keyID)
+		}
+	}
+	cli.appStateKeyRequestsLock.Unlock()
+	cli.requestAppStateKeys(ctx, filteredKeyIDs)
+}
+
+func (cli *Client) requestAppStateKeys(ctx context.Context, rawKeyIDs [][]byte) {
+	keyIDs := make([]*waProto.AppStateSyncKeyId, len(rawKeyIDs))
+	debugKeyIDs := make([]string, len(rawKeyIDs))
+	for i, keyID := range rawKeyIDs {
+		keyIDs[i] = &waProto.AppStateSyncKeyId{KeyId: keyID}
+		debugKeyIDs[i] = hex.EncodeToString(keyID)
+	}
+	msg := &waProto.Message{
+		ProtocolMessage: &waProto.ProtocolMessage{
+			Type: waProto.ProtocolMessage_APP_STATE_SYNC_KEY_REQUEST.Enum(),
+			AppStateSyncKeyRequest: &waProto.AppStateSyncKeyRequest{
+				KeyIds: keyIDs,
+			},
+		},
+	}
+	if cli.Store.ID == nil {
+		return
+	}
+	cli.Log.Infof("Sending key request for app state keys %+v", debugKeyIDs)
+	_, err := cli.SendMessage(ctx, cli.Store.ID.ToNonAD(), "", msg)
+	if err != nil {
+		cli.Log.Warnf("Failed to send app state key request: %v", err)
+	}
 }

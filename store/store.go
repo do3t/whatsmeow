@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tulir Asokan
+// Copyright (c) 2022 Tulir Asokan
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -8,6 +8,7 @@
 package store
 
 import (
+	"fmt"
 	"time"
 
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -71,10 +72,17 @@ type AppStateStore interface {
 	GetAppStateMutationMAC(name string, indexMAC []byte) (valueMAC []byte, err error)
 }
 
+type ContactEntry struct {
+	JID       types.JID
+	FirstName string
+	FullName  string
+}
+
 type ContactStore interface {
 	PutPushName(user types.JID, pushName string) (bool, string, error)
-	PutBusinessName(user types.JID, businessName string) error
+	PutBusinessName(user types.JID, businessName string) (bool, string, error)
 	PutContactName(user types.JID, fullName, firstName string) error
+	PutAllContactNames(contacts []ContactEntry) error
 	GetContact(user types.JID) (types.ContactInfo, error)
 	GetAllContacts() (map[types.JID]types.ContactInfo, error)
 }
@@ -116,6 +124,16 @@ type Device struct {
 	Contacts     ContactStore
 	ChatSettings ChatSettingsStore
 	Container    DeviceContainer
+
+	DatabaseErrorHandler func(device *Device, action string, attemptIndex int, err error) (retry bool)
+}
+
+func (device *Device) handleDatabaseError(attemptIndex int, err error, action string, args ...interface{}) bool {
+	if device.DatabaseErrorHandler != nil {
+		return device.DatabaseErrorHandler(device, fmt.Sprintf(action, args...), attemptIndex, err)
+	}
+	device.Log.Errorf("Failed to %s: %v", fmt.Sprintf(action, args...), err)
+	return false
 }
 
 func (device *Device) Save() error {

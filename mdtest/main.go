@@ -9,6 +9,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -17,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -30,6 +32,7 @@ import (
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -43,6 +46,7 @@ var logLevel = "INFO"
 var debugLogs = flag.Bool("debug", false, "Enable debug logs?")
 var dbDialect = flag.String("db-dialect", "sqlite3", "Database dialect (sqlite3 or postgres)")
 var dbAddress = flag.String("db-address", "file:mdtest.db?_foreign_keys=on", "Database address")
+var requestFullSync = flag.Bool("request-full-sync", false, "Request full (1 year) history sync when logging in?")
 
 func main() {
 	waBinary.IndentXML = true
@@ -50,6 +54,9 @@ func main() {
 
 	if *debugLogs {
 		logLevel = "DEBUG"
+	}
+	if *requestFullSync {
+		store.DeviceProps.RequireFullSync = proto.Bool(true)
 	}
 	log = waLog.Stdout("Main", logLevel, true)
 
@@ -175,6 +182,21 @@ func handleCmd(cmd string, args []string) {
 				log.Errorf("Failed to sync app state: %v", err)
 			}
 		}
+	case "request-appstate-key":
+		if len(args) < 1 {
+			log.Errorf("Usage: request-appstate-key <ids...>")
+			return
+		}
+		var keyIDs = make([][]byte, len(args))
+		for i, id := range args {
+			decoded, err := hex.DecodeString(id)
+			if err != nil {
+				log.Errorf("Failed to decode %s as hex: %v", id, err)
+				return
+			}
+			keyIDs[i] = decoded
+		}
+		cli.DangerousInternals().RequestAppStateKeys(context.Background(), keyIDs)
 	case "checkuser":
 		if len(args) < 1 {
 			log.Errorf("Usage: checkuser <phone numbers...>")
@@ -190,6 +212,20 @@ func handleCmd(cmd string, args []string) {
 				} else {
 					log.Infof("%s: on whatsapp: %t, JID: %s", item.Query, item.IsIn, item.JID)
 				}
+			}
+		}
+	case "checkupdate":
+		resp, err := cli.CheckUpdate()
+		if err != nil {
+			log.Errorf("Failed to check for updates: %v", err)
+		} else {
+			log.Debugf("Version data: %#v", resp)
+			if resp.ParsedVersion == store.GetWAVersion() {
+				log.Infof("Client is up to date")
+			} else if store.GetWAVersion().LessThan(resp.ParsedVersion) {
+				log.Warnf("Client is outdated")
+			} else {
+				log.Infof("Client is newer than latest")
 			}
 		}
 	case "subscribepresence":
@@ -208,8 +244,14 @@ func handleCmd(cmd string, args []string) {
 	case "presence":
 		fmt.Println(cli.SendPresence(types.Presence(args[0])))
 	case "chatpresence":
-		jid, _ := types.ParseJID(args[1])
-		fmt.Println(cli.SendChatPresence(types.ChatPresence(args[0]), jid))
+		if len(args) == 2 {
+			args = append(args, "")
+		} else if len(args) < 2 {
+			log.Errorf("Usage: chatpresence <jid> <composing/paused> [audio]")
+			return
+		}
+		jid, _ := types.ParseJID(args[0])
+		fmt.Println(cli.SendChatPresence(jid, types.ChatPresence(args[1]), types.ChatPresenceMedia(args[2])))
 	case "privacysettings":
 		resp, err := cli.TryFetchPrivacySettings(false)
 		if err != nil {
@@ -240,14 +282,18 @@ func handleCmd(cmd string, args []string) {
 		}
 	case "getavatar":
 		if len(args) < 1 {
-			log.Errorf("Usage: getavatar <jid>")
+			log.Errorf("Usage: getavatar <jid> [existing ID] [--preview]")
 			return
 		}
 		jid, ok := parseJID(args[0])
 		if !ok {
 			return
 		}
-		pic, err := cli.GetProfilePictureInfo(jid, len(args) > 1 && args[1] == "preview")
+		existingID := ""
+		if len(args) > 2 {
+			existingID = args[2]
+		}
+		pic, err := cli.GetProfilePictureInfo(jid, args[len(args)-1] == "--preview", existingID)
 		if err != nil {
 			log.Errorf("Failed to get avatar: %v", err)
 		} else if pic != nil {
@@ -333,6 +379,28 @@ func handleCmd(cmd string, args []string) {
 		} else {
 			log.Infof("Joined %s", groupID)
 		}
+	case "getstatusprivacy":
+		resp, err := cli.GetStatusPrivacy()
+		fmt.Println(err)
+		fmt.Println(resp)
+	case "setdisappeartimer":
+		if len(args) < 2 {
+			log.Errorf("Usage: setdisappeartimer <jid> <days>")
+			return
+		}
+		days, err := strconv.Atoi(args[1])
+		if err != nil {
+			log.Errorf("Invalid duration: %v", err)
+			return
+		}
+		recipient, ok := parseJID(args[0])
+		if !ok {
+			return
+		}
+		err = cli.SetDisappearingTimer(recipient, time.Duration(days)*24*time.Hour)
+		if err != nil {
+			log.Errorf("Failed to set disappearing timer: %v", err)
+		}
 	case "send":
 		if len(args) < 2 {
 			log.Errorf("Usage: send <jid> <text>")
@@ -343,11 +411,92 @@ func handleCmd(cmd string, args []string) {
 			return
 		}
 		msg := &waProto.Message{Conversation: proto.String(strings.Join(args[1:], " "))}
-		ts, err := cli.SendMessage(recipient, "", msg)
+		resp, err := cli.SendMessage(context.Background(), recipient, "", msg)
 		if err != nil {
 			log.Errorf("Error sending message: %v", err)
 		} else {
-			log.Infof("Message sent (server timestamp: %s)", ts)
+			log.Infof("Message sent (server timestamp: %s)", resp.Timestamp)
+		}
+	case "multisend":
+		if len(args) < 3 {
+			log.Errorf("Usage: multisend <jids...> -- <text>")
+			return
+		}
+		var recipients []types.JID
+		for len(args) > 0 && args[0] != "--" {
+			recipient, ok := parseJID(args[0])
+			args = args[1:]
+			if !ok {
+				return
+			}
+			recipients = append(recipients, recipient)
+		}
+		if len(args) == 0 {
+			log.Errorf("Usage: multisend <jids...> -- <text> (the -- is required)")
+			return
+		}
+		msg := &waProto.Message{Conversation: proto.String(strings.Join(args[1:], " "))}
+		for _, recipient := range recipients {
+			go func(recipient types.JID) {
+				resp, err := cli.SendMessage(context.Background(), recipient, "", msg)
+				if err != nil {
+					log.Errorf("Error sending message to %s: %v", recipient, err)
+				} else {
+					log.Infof("Message sent to %s (server timestamp: %s)", recipient, resp.Timestamp)
+				}
+			}(recipient)
+		}
+	case "react":
+		if len(args) < 3 {
+			log.Errorf("Usage: react <jid> <message ID> <reaction>")
+			return
+		}
+		recipient, ok := parseJID(args[0])
+		if !ok {
+			return
+		}
+		messageID := args[1]
+		fromMe := false
+		if strings.HasPrefix(messageID, "me:") {
+			fromMe = true
+			messageID = messageID[len("me:"):]
+		}
+		reaction := args[2]
+		if reaction == "remove" {
+			reaction = ""
+		}
+		msg := &waProto.Message{
+			ReactionMessage: &waProto.ReactionMessage{
+				Key: &waProto.MessageKey{
+					RemoteJid: proto.String(recipient.String()),
+					FromMe:    proto.Bool(fromMe),
+					Id:        proto.String(messageID),
+				},
+				Text:              proto.String(reaction),
+				SenderTimestampMs: proto.Int64(time.Now().UnixMilli()),
+			},
+		}
+		resp, err := cli.SendMessage(context.Background(), recipient, "", msg)
+		if err != nil {
+			log.Errorf("Error sending reaction: %v", err)
+		} else {
+			log.Infof("Reaction sent (server timestamp: %s)", resp.Timestamp)
+		}
+	case "revoke":
+		if len(args) < 2 {
+			log.Errorf("Usage: revoke <jid> <message ID>")
+			return
+		}
+		recipient, ok := parseJID(args[0])
+		if !ok {
+			return
+		}
+		messageID := args[1]
+		resp, err := cli.RevokeMessage(recipient, messageID)
+		if err != nil {
+			log.Errorf("Error sending revocation: %v", err)
+		} else {
+			log.Infof("Revocation sent (server timestamp: %s)", resp.Timestamp)
 		}
 	case "sendimg":
 		if len(args) < 2 {
@@ -378,11 +527,22 @@ func handleCmd(cmd string, args []string) {
 			FileSha256:    uploaded.FileSHA256,
 			FileLength:    proto.Uint64(uint64(len(data))),
 		}}
-		ts, err := cli.SendMessage(recipient, "", msg)
+		resp, err := cli.SendMessage(context.Background(), recipient, "", msg)
 		if err != nil {
 			log.Errorf("Error sending image message: %v", err)
 		} else {
-			log.Infof("Image message sent (server timestamp: %s)", ts)
+			log.Infof("Image message sent (server timestamp: %s)", resp.Timestamp)
+		}
+	case "setstatus":
+		if len(args) == 0 {
+			log.Errorf("Usage: setstatus <message>")
+			return
+		}
+		err := cli.SetStatusMessage(strings.Join(args, " "))
+		if err != nil {
+			log.Errorf("Error setting status message: %v", err)
+		} else {
+			log.Infof("Status updated")
 		}
 	}
 }
@@ -483,5 +643,19 @@ func handler(rawEvt interface{}) {
 		_ = file.Close()
 	case *events.AppState:
 		log.Debugf("App state event: %+v / %+v", evt.Index, evt.SyncActionValue)
+	case *events.KeepAliveTimeout:
+		log.Debugf("Keepalive timeout event: %+v", evt)
+		if evt.ErrorCount > 3 {
+			log.Debugf("Got >3 keepalive timeouts, forcing reconnect")
+			go func() {
+				cli.Disconnect()
+				err := cli.Connect()
+				if err != nil {
+					log.Errorf("Error force-reconnecting after keepalive timeouts: %v", err)
+				}
+			}()
+		}
+	case *events.KeepAliveRestored:
+		log.Debugf("Keepalive restored")
 	}
 }

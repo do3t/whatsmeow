@@ -8,12 +8,12 @@ const addPrefix = (lines, prefix) => lines.map(line => prefix + line)
 async function findAppModules(mods) {
     const ua = {
         headers: {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:95.0) Gecko/20100101 Firefox/95.0",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8", /**/
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:103.0) Gecko/20100101 Firefox/103.0",
+            "Sec-Fetch-Dest": "script",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "same-origin",
+            "Referer": "https://web.whatsapp.com/",
+            "Accept": "*/*",
             "Accept-Language": "Accept-Language: en-US,en;q=0.5",
         }
     }
@@ -23,11 +23,12 @@ async function findAppModules(mods) {
     const bootstrapQRURL = baseURL + "/bootstrap_qr." + bootstrapQRID + ".js"
     console.error("Found bootstrap_qr.js URL:", bootstrapQRURL)
     const qrData = await request.get(bootstrapQRURL, ua)
-    const waVersion = qrData.match(/VERSION_STR:"(\d\.\d+\.\d+)"/)[1]
+    const waVersion = qrData.match(/appVersion:"(\d\.\d+\.\d+)"/)[1]
     console.log("Current version:", waVersion)
     // This one list of types is so long that it's split into two JavaScript declarations.
     // The module finder below can't handle it, so just patch it manually here.
-    const patchedQrData = qrData.replace("ButtonsResponseMessageType=void 0,t.ActionLinkSpec", "ButtonsResponseMessageType=t.ActionLinkSpec")
+    const patchedQrData = qrData.replace("t.ActionLinkSpec=void 0,t.TemplateButtonSpec", "t.ActionLinkSpec=t.TemplateButtonSpec")
+    //const patchedQrData = qrData.replace("Spec=void 0,t.", "Spec=t.")
     const qrModules = acorn.parse(patchedQrData).body[0].expression.arguments[0].elements[1].properties
     return qrModules.filter(m => mods.includes(m.key.value))
 }
@@ -35,39 +36,28 @@ async function findAppModules(mods) {
 (async () => {
     // The module IDs that contain protobuf types
     const wantedModules = [
-        84593, // AppVersion, UserAgent, WebdPayload ...
-        85579, // BizIdentityInfo, BizAccountLinkInfo, ...
-        31057, // SyncActionData, StarAction, ...
-        97264, // SyncdPatch, SyncdMutation, ...
-        17907, // ServerErrorReceipt, MediaRetryNotification, ...
-        8506, // MsgOpaqueData, MsgRowOpaqueData
-        83723, // GroupParticipant, Pushname, HistorySyncMsg, ...
-        43569, // EphemeralSetting
-        60934, // CallButton, TemplateButton, ..., ActionLink, ..., QuickReplyButton, URLButton, ...
-        77811, // AppVersion, CompanionProps, CompanionPropsPlatform
-        9856, // ADVSignedDeviceIdentityHMAC, ADVSignedDeviceIdentity, ...
-        75359, // MessageKey
-        68719, // Reaction, UserReceipt, PhotoChange, WebMessageInfoStatus, ...
+        618036, // ADVSignedKeyIndexList, ADVSignedDeviceIdentity, ADVSignedDeviceIdentityHMAC, ADVKeyIndexList, ADVDeviceIdentity
+        395782, // DeviceProps
+        970016, // Message, ..., RequestPaymentMessage, Reaction, QuickReplyButton, ..., ButtonsResponseMessage, ActionLink, ...
+        118494, // EphemeralSetting
+        655919, // WallpaperSettings, Pushname, MediaVisibility, HistorySync, ..., GroupParticipant, ...
+        575637, // PollEncValue, MsgOpaqueData, MsgRowOpaqueData
+        692440, // ServerErrorReceipt, MediaRetryNotification, MediaRetryNotificationResult
+        135923, // MessageKey
+        370910, // Duplicate of MessageKey
+        550073, // SyncdVersion, SyncdValue, ..., SyncdPatch, SyncdMutation, ..., ExitCode
+        381,   // SyncActionValue, ..., UnarchiveChatsSetting, SyncActionData, StarAction, ...
+        482593, // VerifiedNameCertificate, LocalizedName, ..., BizIdentityInfo, BizAccountLinkInfo, ...
+        92776, // HandshakeMessage, ..., ClientPayload, ..., AppVersion, UserAgent, WebdPayload ...
+        // 275511, // seems to be same as above
+        956262, // Reaction, UserReceipt, ..., PhotoChange, ..., WebFeatures, ..., WebMessageInfoStatus, ...
+        819601, // NoiseCertificate, CertChain
     ]
-    // Conflicting specs by module ID and what to rename them to
-    const renames = {
-        85579: {
-            "Details": "VerifiedNameDetails",
-        },
-        84593: {
-            "Details": "NoiseCertificateDetails",
-        },
-        60934: {
-            "MediaData": "PBMediaData",
-        }
-    }
     const unspecName = name => name.endsWith("Spec") ? name.slice(0, -4) : name
-    const makeRenameFunc = modID => name => {
-        name = unspecName(name)
-        return renames[modID]?.[name] ?? name
-    }
-    // The constructor ID that's used in all enum types
-    const enumConstructorID = 54302
+    const unnestName = name => name.replace("Message$", "").replace("SyncActionValue$", "") // Don't nest messages into Message, that's too much nesting
+    const rename = name => unnestName(unspecName(name))
+    // The constructor IDs that can be used for enum types
+    const enumConstructorIDs = [76672, 654302]
 
     const unsortedModules = await findAppModules(wantedModules)
     if (unsortedModules.length !== wantedModules.length) {
@@ -97,7 +87,6 @@ async function findAppModules(mods) {
     // find all identifiers and, for enums, their array of values
     for (const mod of modules) {
         const modInfo = modulesInfo[mod.key.value]
-        const rename = makeRenameFunc(mod.key.value)
 
         // all identifiers will be initialized to "void 0" (i.e. "undefined") at the start, so capture them here
         walk.ancestor(mod, {
@@ -112,9 +101,6 @@ async function findAppModules(mods) {
                     const makeBlankIdent = a => {
                         const key = rename(a.property.name)
                         const value = {name: key}
-                        if (key !== unspecName(a.property.name)) {
-                            value.renamedFrom = unspecName(a.property.name)
-                        }
                         return [key, value]
                     }
                     modInfo.identifiers = Object.fromEntries(assignments.map(makeBlankIdent).reverse())
@@ -132,7 +118,7 @@ async function findAppModules(mods) {
                 }
             },
             VariableDeclarator(node) {
-                if (node.init && node.init.type === "CallExpression" && node.init.callee?.arguments?.[0]?.value === enumConstructorID && node.init.arguments.length === 1 && node.init.arguments[0].type === "ObjectExpression") {
+                if (node.init && node.init.type === "CallExpression" && enumConstructorIDs.includes(node.init.callee?.arguments?.[0]?.value) && node.init.arguments.length === 1 && node.init.arguments[0].type === "ObjectExpression") {
                     enumAliases[node.id.name] = node.init.arguments[0].properties.map(p => ({
                         name: p.key.name,
                         id: p.value.value
@@ -145,7 +131,6 @@ async function findAppModules(mods) {
     // find the contents for all protobuf messages
     for (const mod of modules) {
         const modInfo = modulesInfo[mod.key.value]
-        const rename = makeRenameFunc(mod.key.value)
 
         // message specifications are stored in a "internalSpec" attribute of the respective identifier alias
         walk.simple(mod, {
@@ -219,27 +204,38 @@ async function findAppModules(mods) {
                     })
 
                     targetIdent.members = members
+                    targetIdent.children = []
                 }
             }
         })
     }
 
-    // make all enums only one message uses be local to that message
+    const findNested = (items, path) => {
+        if (path.length === 0) {
+            return items
+        }
+        const item = items.find(v => (v.unnestedName ?? v.name) === path[0])
+        if (path.length === 1) {
+            return item
+        }
+        return findNested(item.children, path.slice(1))
+    }
+
+
     for (const mod of modules) {
         const idents = modulesInfo[mod.key.value].identifiers
         for (const ident of Object.values(idents)) {
-            if (!ident.enumValues) {
+            if (!ident.name.includes("$")) {
                 continue
             }
-            // count number of occurrences of this enumeration and store these identifiers
-            const occurrences = Object.values(idents).filter(v => v.members && v.members.find(m => m.type === ident.name))
-            // if there's only one occurrence, add the enum to that message. Also remove enums that do not occur anywhere
-            if (occurrences.length <= 1) {
-                if (occurrences.length === 1) {
-                    idents[occurrences[0].name].members.find(m => m.type === ident.name).enumValues = ident.enumValues
-                }
-                delete idents[ident.name]
+            const parts = ident.name.split("$")
+            const parent = findNested(Object.values(idents), parts.slice(0, -1))
+            if (!parent) {
+                continue
             }
+            parent.children.push(ident)
+            delete idents[ident.name]
+            ident.unnestedName = parts[parts.length-1]
         }
     }
 
@@ -249,6 +245,14 @@ async function findAppModules(mods) {
         "package proto;",
         ""
     ]
+    const sharesParent = (path1, path2) => {
+        for (let i = 0; i < path1.length - 1 && i < path2.length - 1; i++) {
+            if (path1[i] != path2[i]) {
+                return false
+            }
+        }
+        return true
+    }
     const spaceIndent = " ".repeat(4)
     for (const mod of modules) {
         const modInfo = modulesInfo[mod.key.value]
@@ -256,17 +260,17 @@ async function findAppModules(mods) {
         // enum stringifying function
         const stringifyEnum = (ident, overrideName = null) =>
             [].concat(
-                [`enum ${overrideName || ident.name} {`],
+                [`enum ${overrideName ?? ident.unnestedName ?? ident.name} {`],
                 addPrefix(ident.enumValues.map(v => `${v.name} = ${v.id};`), spaceIndent),
                 ["}"]
             )
 
         // message specification member stringifying function
-        const stringifyMessageSpecMember = (info, completeFlags = true) => {
+        const stringifyMessageSpecMember = (info, path, completeFlags = true) => {
             if (info.type === "__oneof__") {
                 return [].concat(
                     [`oneof ${info.name} {`],
-                    addPrefix([].concat(...info.members.map(m => stringifyMessageSpecMember(m, false))), spaceIndent),
+                    addPrefix([].concat(...info.members.map(m => stringifyMessageSpecMember(m, path, false))), spaceIndent),
                     ["}"]
                 )
             } else {
@@ -278,7 +282,12 @@ async function findAppModules(mods) {
                     info.flags.push("optional")
                 }
                 const ret = info.enumValues ? stringifyEnum(info, info.type) : []
-                ret.push(`${info.flags.join(" ") + (info.flags.length === 0 ? "" : " ")}${info.type} ${info.name} = ${info.id}${info.packed || ""};`)
+                const typeParts = info.type.split("$")
+                let unnestedType = typeParts[typeParts.length-1]
+                if (!sharesParent(typeParts, path.split("$"))) {
+                    unnestedType = typeParts.join(".")
+                }
+                ret.push(`${info.flags.join(" ") + (info.flags.length === 0 ? "" : " ")}${unnestedType} ${info.name} = ${info.id}${info.packed || ""};`)
                 return ret
             }
         }
@@ -286,12 +295,10 @@ async function findAppModules(mods) {
         // message specification stringifying function
         const stringifyMessageSpec = (ident) => {
             let result = []
-            if (ident.renamedFrom) {
-                result.push(`// Renamed from ${ident.renamedFrom}`)
-            }
             result.push(
-                `message ${ident.name} {`,
-                ...addPrefix([].concat(...ident.members.map(m => stringifyMessageSpecMember(m))), spaceIndent),
+                `message ${ident.unnestedName ?? ident.name} {`,
+                ...addPrefix([].concat(...ident.children.map(m => stringifyEntity(m))), spaceIndent),
+                ...addPrefix([].concat(...ident.members.map(m => stringifyMessageSpecMember(m, ident.name))), spaceIndent),
                 "}",
             )
             if (addedMessages.has(ident.name)) {
@@ -304,7 +311,18 @@ async function findAppModules(mods) {
             return result
         }
 
-        decodedProto = decodedProto.concat(...Object.values(modInfo.identifiers).map(v => v.members ? stringifyMessageSpec(v) : stringifyEnum(v)))
+        const stringifyEntity = v => {
+            if (v.members) {
+                return stringifyMessageSpec(v)
+            } else if (v.enumValues) {
+                return stringifyEnum(v)
+            } else {
+                console.error(v)
+                return "// Unknown entity"
+            }
+        }
+
+        decodedProto = decodedProto.concat(...Object.values(modInfo.identifiers).map(stringifyEntity))
     }
     const decodedProtoStr = decodedProto.join("\n") + "\n"
     await fs.writeFile("../def.proto", decodedProtoStr)

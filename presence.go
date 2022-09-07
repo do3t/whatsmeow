@@ -7,7 +7,7 @@
 package whatsmeow
 
 import (
-	"time"
+	"sync/atomic"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/types"
@@ -15,7 +15,7 @@ import (
 )
 
 func (cli *Client) handleChatState(node *waBinary.Node) {
-	source, err := cli.parseMessageSource(node)
+	source, err := cli.parseMessageSource(node, true)
 	if err != nil {
 		cli.Log.Warnf("Failed to parse chat state update: %v", err)
 	} else if len(node.GetChildren()) != 1 {
@@ -23,12 +23,14 @@ func (cli *Client) handleChatState(node *waBinary.Node) {
 	} else {
 		child := node.GetChildren()[0]
 		presence := types.ChatPresence(child.Tag)
-		if presence != types.ChatPresenceComposing && presence != types.ChatPresenceRecording && presence != types.ChatPresencePaused {
+		if presence != types.ChatPresenceComposing && presence != types.ChatPresencePaused {
 			cli.Log.Warnf("Unrecognized chat presence state %s", child.Tag)
 		}
+		media := types.ChatPresenceMedia(child.AttrGetter().OptionalString("media"))
 		cli.dispatchEvent(&events.ChatPresence{
 			MessageSource: source,
 			State:         presence,
+			Media:         media,
 		})
 	}
 }
@@ -45,7 +47,7 @@ func (cli *Client) handlePresence(node *waBinary.Node) {
 	}
 	lastSeen := ag.OptionalString("last")
 	if lastSeen != "" && lastSeen != "deny" {
-		evt.LastSeen = time.Unix(ag.Int64("last"), 0)
+		evt.LastSeen = ag.UnixTime("last")
 	}
 	if !ag.OK() {
 		cli.Log.Warnf("Error parsing presence event: %+v", ag.Errors)
@@ -61,6 +63,11 @@ func (cli *Client) handlePresence(node *waBinary.Node) {
 func (cli *Client) SendPresence(state types.Presence) error {
 	if len(cli.Store.PushName) == 0 {
 		return ErrNoPushName
+	}
+	if state == types.PresenceAvailable {
+		atomic.CompareAndSwapUint32(&cli.sendActiveReceipts, 0, 1)
+	} else {
+		atomic.CompareAndSwapUint32(&cli.sendActiveReceipts, 1, 0)
 	}
 	return cli.sendNode(waBinary.Node{
 		Tag: "presence",
@@ -89,13 +96,21 @@ func (cli *Client) SubscribePresence(jid types.JID) error {
 }
 
 // SendChatPresence updates the user's typing status in a specific chat.
-func (cli *Client) SendChatPresence(state types.ChatPresence, jid types.JID) error {
+//
+// The media parameter can be set to indicate the user is recording media (like a voice message) rather than typing a text message.
+func (cli *Client) SendChatPresence(jid types.JID, state types.ChatPresence, media types.ChatPresenceMedia) error {
+	content := []waBinary.Node{{Tag: string(state)}}
+	if state == types.ChatPresenceComposing && len(media) > 0 {
+		content[0].Attrs = waBinary.Attrs{
+			"media": string(media),
+		}
+	}
 	return cli.sendNode(waBinary.Node{
 		Tag: "chatstate",
 		Attrs: waBinary.Attrs{
 			"from": *cli.Store.ID,
 			"to":   jid,
 		},
-		Content: []waBinary.Node{{Tag: string(state)}},
+		Content: content,
 	})
 }

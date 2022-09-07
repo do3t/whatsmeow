@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tulir Asokan
+// Copyright (c) 2022 Tulir Asokan
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -67,7 +67,7 @@ var _ store.ContactStore = (*SQLStore)(nil)
 const (
 	putIdentityQuery = `
 		INSERT INTO whatsmeow_identity_keys (our_jid, their_id, identity) VALUES ($1, $2, $3)
-		ON CONFLICT (our_jid, their_id) DO UPDATE SET identity=$3
+		ON CONFLICT (our_jid, their_id) DO UPDATE SET identity=excluded.identity
 	`
 	deleteAllIdentitiesQuery = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id LIKE $2`
 	deleteIdentityQuery      = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
@@ -108,7 +108,7 @@ const (
 	hasSessionQuery = `SELECT true FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id=$2`
 	putSessionQuery = `
 		INSERT INTO whatsmeow_sessions (our_jid, their_id, session) VALUES ($1, $2, $3)
-		ON CONFLICT (our_jid, their_id) DO UPDATE SET session=$3
+		ON CONFLICT (our_jid, their_id) DO UPDATE SET session=excluded.session
 	`
 	deleteAllSessionsQuery = `DELETE FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id LIKE $2`
 	deleteSessionQuery     = `DELETE FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id=$2`
@@ -259,7 +259,7 @@ const (
 	getSenderKeyQuery = `SELECT sender_key FROM whatsmeow_sender_keys WHERE our_jid=$1 AND chat_id=$2 AND sender_id=$3`
 	putSenderKeyQuery = `
 		INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key) VALUES ($1, $2, $3, $4)
-		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET sender_key=$4
+		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET sender_key=excluded.sender_key
 	`
 )
 
@@ -279,7 +279,8 @@ func (s *SQLStore) GetSenderKey(group, user string) (key []byte, err error) {
 const (
 	putAppStateSyncKeyQuery = `
 		INSERT INTO whatsmeow_app_state_sync_keys (jid, key_id, key_data, timestamp, fingerprint) VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (jid, key_id) DO UPDATE SET key_data=$3, timestamp=$4, fingerprint=$5
+		ON CONFLICT (jid, key_id) DO UPDATE
+			SET key_data=excluded.key_data, timestamp=excluded.timestamp, fingerprint=excluded.fingerprint
 	`
 	getAppStateSyncKeyQuery = `SELECT key_data, timestamp, fingerprint FROM whatsmeow_app_state_sync_keys WHERE jid=$1 AND key_id=$2`
 )
@@ -301,7 +302,7 @@ func (s *SQLStore) GetAppStateSyncKey(id []byte) (*store.AppStateSyncKey, error)
 const (
 	putAppStateVersionQuery = `
 		INSERT INTO whatsmeow_app_state_version (jid, name, version, hash) VALUES ($1, $2, $3, $4)
-		ON CONFLICT (jid, name) DO UPDATE SET version=$3, hash=$4
+		ON CONFLICT (jid, name) DO UPDATE SET version=excluded.version, hash=excluded.hash
 	`
 	getAppStateVersionQuery                 = `SELECT version, hash FROM whatsmeow_app_state_version WHERE jid=$1 AND name=$2`
 	deleteAppStateVersionQuery              = `DELETE FROM whatsmeow_app_state_version WHERE jid=$1 AND name=$2`
@@ -349,15 +350,15 @@ func (s *SQLStore) putAppStateMutationMACs(tx execable, name string, version uin
 	values[0] = s.JID
 	values[1] = name
 	values[2] = version
+	placeholderSyntax := "($1, $2, $3, $%d, $%d)"
+	if s.dialect == "sqlite3" {
+		placeholderSyntax = "(?1, ?2, ?3, ?%d, ?%d)"
+	}
 	for i, mutation := range mutations {
 		baseIndex := 3 + i*2
 		values[baseIndex] = mutation.IndexMAC
 		values[baseIndex+1] = mutation.ValueMAC
-		if s.dialect == "sqlite3" {
-			queryParts[i] = fmt.Sprintf("(?1, ?2, ?3, ?%d, ?%d)", baseIndex+1, baseIndex+2)
-		} else {
-			queryParts[i] = fmt.Sprintf("($1, $2, $3, $%d, $%d)", baseIndex+1, baseIndex+2)
-		}
+		queryParts[i] = fmt.Sprintf(placeholderSyntax, baseIndex+1, baseIndex+2)
 	}
 	_, err := tx.Exec(putAppStateMutationMACsQuery+strings.Join(queryParts, ","), values...)
 	return err
@@ -426,15 +427,20 @@ func (s *SQLStore) GetAppStateMutationMAC(name string, indexMAC []byte) (valueMA
 const (
 	putContactNameQuery = `
 		INSERT INTO whatsmeow_contacts (our_jid, their_jid, first_name, full_name) VALUES ($1, $2, $3, $4)
-		ON CONFLICT (our_jid, their_jid) DO UPDATE SET first_name=$3, full_name=$4
+		ON CONFLICT (our_jid, their_jid) DO UPDATE SET first_name=excluded.first_name, full_name=excluded.full_name
+	`
+	putManyContactNamesQuery = `
+		INSERT INTO whatsmeow_contacts (our_jid, their_jid, first_name, full_name)
+		VALUES %s
+		ON CONFLICT (our_jid, their_jid) DO UPDATE SET first_name=excluded.first_name, full_name=excluded.full_name
 	`
 	putPushNameQuery = `
 		INSERT INTO whatsmeow_contacts (our_jid, their_jid, push_name) VALUES ($1, $2, $3)
-		ON CONFLICT (our_jid, their_jid) DO UPDATE SET push_name=$3
+		ON CONFLICT (our_jid, their_jid) DO UPDATE SET push_name=excluded.push_name
 	`
 	putBusinessNameQuery = `
 		INSERT INTO whatsmeow_contacts (our_jid, their_jid, business_name) VALUES ($1, $2, $3)
-		ON CONFLICT (our_jid, their_jid) DO UPDATE SET business_name=$3
+		ON CONFLICT (our_jid, their_jid) DO UPDATE SET business_name=excluded.business_name
 	`
 	getContactQuery = `
 		SELECT first_name, full_name, push_name, business_name FROM whatsmeow_contacts WHERE our_jid=$1 AND their_jid=$2
@@ -465,23 +471,25 @@ func (s *SQLStore) PutPushName(user types.JID, pushName string) (bool, string, e
 	return false, "", nil
 }
 
-func (s *SQLStore) PutBusinessName(user types.JID, businessName string) error {
+func (s *SQLStore) PutBusinessName(user types.JID, businessName string) (bool, string, error) {
 	s.contactCacheLock.Lock()
 	defer s.contactCacheLock.Unlock()
 
 	cached, err := s.getContact(user)
 	if err != nil {
-		return err
+		return false, "", err
 	}
 	if cached.BusinessName != businessName {
 		_, err = s.db.Exec(putBusinessNameQuery, s.JID, user, businessName)
 		if err != nil {
-			return err
+			return false, "", err
 		}
+		previousName := cached.BusinessName
 		cached.BusinessName = businessName
 		cached.Found = true
+		return true, previousName, nil
 	}
-	return nil
+	return false, "", nil
 }
 
 func (s *SQLStore) PutContactName(user types.JID, firstName, fullName string) error {
@@ -501,6 +509,77 @@ func (s *SQLStore) PutContactName(user types.JID, firstName, fullName string) er
 		cached.FullName = fullName
 		cached.Found = true
 	}
+	return nil
+}
+
+const contactBatchSize = 300
+
+func (s *SQLStore) putContactNamesBatch(tx execable, contacts []store.ContactEntry) error {
+	values := make([]interface{}, 1, 1+len(contacts)*3)
+	queryParts := make([]string, 0, len(contacts))
+	values[0] = s.JID
+	placeholderSyntax := "($1, $%d, $%d, $%d)"
+	if s.dialect == "sqlite3" {
+		placeholderSyntax = "(?1, ?%d, ?%d, ?%d)"
+	}
+	i := 0
+	handledContacts := make(map[types.JID]struct{}, len(contacts))
+	for _, contact := range contacts {
+		if contact.JID.IsEmpty() {
+			s.log.Warnf("Empty contact info in mass insert: %+v", contact)
+			continue
+		}
+		// The whole query will break if there are duplicates, so make sure there aren't any duplicates
+		_, alreadyHandled := handledContacts[contact.JID]
+		if alreadyHandled {
+			s.log.Warnf("Duplicate contact info for %s in mass insert", contact.JID)
+			continue
+		}
+		handledContacts[contact.JID] = struct{}{}
+		baseIndex := i*3 + 1
+		values = append(values, contact.JID.String(), contact.FirstName, contact.FullName)
+		queryParts = append(queryParts, fmt.Sprintf(placeholderSyntax, baseIndex+1, baseIndex+2, baseIndex+3))
+		i++
+	}
+	_, err := tx.Exec(fmt.Sprintf(putManyContactNamesQuery, strings.Join(queryParts, ",")), values...)
+	return err
+}
+
+func (s *SQLStore) PutAllContactNames(contacts []store.ContactEntry) error {
+	if len(contacts) > contactBatchSize {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return fmt.Errorf("failed to start transaction: %w", err)
+		}
+		for i := 0; i < len(contacts); i += contactBatchSize {
+			var contactSlice []store.ContactEntry
+			if len(contacts) > i+contactBatchSize {
+				contactSlice = contacts[i : i+contactBatchSize]
+			} else {
+				contactSlice = contacts[i:]
+			}
+			err = s.putContactNamesBatch(tx, contactSlice)
+			if err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+		}
+		err = tx.Commit()
+		if err != nil {
+			return fmt.Errorf("failed to commit transaction: %w", err)
+		}
+	} else if len(contacts) > 0 {
+		err := s.putContactNamesBatch(s.db, contacts)
+		if err != nil {
+			return err
+		}
+	} else {
+		return nil
+	}
+	s.contactCacheLock.Lock()
+	// Just clear the cache, fetching pushnames and business names would be too much effort
+	s.contactCache = make(map[types.JID]*types.ContactInfo)
+	s.contactCacheLock.Unlock()
 	return nil
 }
 
@@ -567,7 +646,7 @@ func (s *SQLStore) GetAllContacts() (map[types.JID]types.ContactInfo, error) {
 const (
 	putChatSettingQuery = `
 		INSERT INTO whatsmeow_chat_settings (our_jid, chat_jid, %[1]s) VALUES ($1, $2, $3)
-		ON CONFLICT (our_jid, chat_jid) DO UPDATE SET %[1]s=$3
+		ON CONFLICT (our_jid, chat_jid) DO UPDATE SET %[1]s=excluded.%[1]s
 	`
 	getChatSettingsQuery = `
 		SELECT muted_until, pinned, archived FROM whatsmeow_chat_settings WHERE our_jid=$1 AND chat_jid=$2

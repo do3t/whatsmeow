@@ -17,6 +17,7 @@ import (
 
 func (cli *Client) handleStreamError(node *waBinary.Node) {
 	atomic.StoreUint32(&cli.isLoggedIn, 0)
+	cli.clearResponseWaiters(node)
 	code, _ := node.Attrs["code"].(string)
 	conflict, _ := node.GetOptionalChildByTag("conflict")
 	conflictType := conflict.AttrGetter().OptionalString("type")
@@ -33,7 +34,7 @@ func (cli *Client) handleStreamError(node *waBinary.Node) {
 	case code == "401" && conflictType == "device_removed":
 		cli.expectDisconnect()
 		cli.Log.Infof("Got device removed stream error, sending LoggedOut event and deleting session")
-		go cli.dispatchEvent(&events.LoggedOut{OnConnect: false})
+		go cli.dispatchEvent(&events.LoggedOut{OnConnect: false, Reason: events.ConnectFailureLoggedOut})
 		err := cli.Store.Delete()
 		if err != nil {
 			cli.Log.Warnf("Failed to delete store after device_removed error: %v", err)
@@ -54,24 +55,49 @@ func (cli *Client) handleStreamError(node *waBinary.Node) {
 
 func (cli *Client) handleIB(node *waBinary.Node) {
 	children := node.GetChildren()
-	if len(children) == 1 && children[0].Tag == "downgrade_webclient" {
-		go cli.dispatchEvent(&events.QRScannedWithoutMultidevice{})
+	for _, child := range children {
+		ag := child.AttrGetter()
+		switch child.Tag {
+		case "downgrade_webclient":
+			go cli.dispatchEvent(&events.QRScannedWithoutMultidevice{})
+		case "offline_preview":
+			cli.dispatchEvent(&events.OfflineSyncPreview{
+				Total:          ag.Int("count"),
+				AppDataChanges: ag.Int("appdata"),
+				Messages:       ag.Int("message"),
+				Notifications:  ag.Int("notification"),
+				Receipts:       ag.Int("receipt"),
+			})
+		case "offline":
+			cli.dispatchEvent(&events.OfflineSyncCompleted{
+				Count: ag.Int("count"),
+			})
+		}
 	}
 }
 
 func (cli *Client) handleConnectFailure(node *waBinary.Node) {
 	ag := node.AttrGetter()
-	reason := ag.String("reason")
-	if reason == "401" {
-		cli.expectDisconnect()
-		cli.Log.Infof("Got 401 connect failure, sending LoggedOut event and deleting session")
-		go cli.dispatchEvent(&events.LoggedOut{OnConnect: true})
+	reason := events.ConnectFailureReason(ag.Int("reason"))
+	cli.expectDisconnect()
+	if reason.IsLoggedOut() {
+		cli.Log.Infof("Got %s connect failure, sending LoggedOut event and deleting session", reason)
+		go cli.dispatchEvent(&events.LoggedOut{OnConnect: true, Reason: reason})
 		err := cli.Store.Delete()
 		if err != nil {
-			cli.Log.Warnf("Failed to delete store after 401 failure: %v", err)
+			cli.Log.Warnf("Failed to delete store after %d failure: %v", int(reason), err)
 		}
+	} else if reason == events.ConnectFailureTempBanned {
+		cli.Log.Warnf("Temporary ban connect failure: %s", node.XMLString())
+		expiryTime := ag.UnixTime("expire")
+		go cli.dispatchEvent(&events.TemporaryBan{
+			Code:   events.TempBanReason(ag.Int("code")),
+			Expire: expiryTime,
+		})
+	} else if reason == events.ConnectFailureClientOutdated {
+		cli.Log.Errorf("Client outdated (405) connect failure")
+		go cli.dispatchEvent(&events.ClientOutdated{})
 	} else {
-		cli.expectDisconnect()
 		cli.Log.Warnf("Unknown connect failure: %s", node.XMLString())
 		go cli.dispatchEvent(&events.ConnectFailure{Reason: reason, Raw: node})
 	}
@@ -100,6 +126,7 @@ func (cli *Client) handleConnectSuccess(node *waBinary.Node) {
 			cli.Log.Warnf("Failed to send post-connect passive IQ: %v", err)
 		}
 		cli.dispatchEvent(&events.Connected{})
+		cli.closeSocketWaitChan()
 	}()
 }
 
